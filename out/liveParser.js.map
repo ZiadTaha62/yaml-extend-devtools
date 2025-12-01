@@ -1,0 +1,1 @@
+{"version":3,"file":"liveParser.js","sourceRoot":"","sources":["../src/liveParser.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,UAAU,EAAE,MAAM,aAAa,CAAC;AAEzC,MAAM,MAAM,GAAG,IAAI,UAAU,CAAC;IAC5B,UAAU,EAAE,IAAI;IAChB,MAAM,EAAE,IAAI;IACZ,aAAa,EAAE,IAAI;IACnB,WAAW,EAAE,IAAI;CAClB,CAAC,CAAC;AAEH,eAAe,MAAM,CAAC"}

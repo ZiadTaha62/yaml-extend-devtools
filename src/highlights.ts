@@ -1,588 +1,228 @@
 import * as vscode from "vscode";
 import {
-  divideByDelimiter,
-  getNextDelimiter,
-  getNextChar,
-  WHITE_SPACE_REGEX,
-} from "./tokinizer.js";
+  ArgsToken,
+  ArgsTokenType,
+  ExprToken,
+  ExprTokenType,
+  KeyValueToken,
+  KeyValueTokenType,
+  LinePos,
+  ModuleCache,
+  Scalar,
+  TextToken,
+  TextTokenType,
+} from "yaml-extend";
+import { SCALAR_ARRAY_MAP } from "./scalar.js";
+import { DIRECTIVE_ARRAY_MAP } from "./directives.js";
 
-/** Color decoration for expression bases. (red) */
-const exprBaseColor = vscode.window.createTextEditorDecorationType({
-  color: "rgba(203, 67, 53, 1)", // #CB4335
-});
+const EXPR_COLORS = [
+  "exprMark",
+  "exprBase",
+  "exprPath",
+  "dot",
+  "argsMark",
+  "key",
+  "equal",
+  "comma",
+  "type",
+] as const;
 
-/** Color decoration for expression data. (soft green) */
-const exprDataColor = vscode.window.createTextEditorDecorationType({
-  color: "rgba(88, 169, 115, 1)", // #58A973
-});
+type DecorationsArray = {
+  linePos: [LinePos, LinePos] | undefined;
+  color: (typeof EXPR_COLORS)[number];
+}[];
 
-/** Color decoration for directive bases. (same red as exprBase) */
-const dirBaseColor = vscode.window.createTextEditorDecorationType({
-  color: "rgba(203, 67, 53, 1)", // #CB4335
-});
-
-/** Color decoration for directive data. (slightly deeper green) */
-const dirDataColor = vscode.window.createTextEditorDecorationType({
-  color: "rgba(46, 160, 98, 1)", // #2EA062
-});
-
-/** Color decoration for key in key=value pairs. (gold) */
-const keyColor = vscode.window.createTextEditorDecorationType({
-  color: "rgba(212, 175, 55, 1)", // #D4AF37
-});
-
-/** Color decoration for value in key=value pairs. (same gold) */
-const valueColor = vscode.window.createTextEditorDecorationType({
-  color: "rgba(212, 175, 55, 1)", // #D4AF37
-});
-
-/** Color decoration for equal sign in key=value pairs. (same red) */
-const equalColor = vscode.window.createTextEditorDecorationType({
-  color: "rgba(203, 67, 53, 1)", // #CB4335
-});
-
-const interpolationColor = vscode.window.createTextEditorDecorationType({
-  color: "rgba(255, 215, 0, 1)",
-});
-
-/** Function to check is char is a white space char. */
-function isWhiteSpace(ch: string) {
-  return WHITE_SPACE_REGEX.test(ch);
-}
-
-type Highlight = {
-  start: number;
-  end: number;
-  color: vscode.TextEditorDecorationType;
+const DECORATION_TYPES: Record<
+  (typeof EXPR_COLORS)[number],
+  vscode.TextEditorDecorationType
+> = {
+  exprMark: vscode.window.createTextEditorDecorationType({
+    color: "#EDA800",
+  }),
+  exprBase: vscode.window.createTextEditorDecorationType({
+    color: "#EDA800",
+  }),
+  dot: vscode.window.createTextEditorDecorationType({
+    color: "#FF5733",
+  }),
+  exprPath: vscode.window.createTextEditorDecorationType({
+    color: "#CF8BA9",
+  }),
+  argsMark: vscode.window.createTextEditorDecorationType({
+    color: "#FF5733",
+  }),
+  key: vscode.window.createTextEditorDecorationType({
+    color: "#E26D5A",
+  }),
+  equal: vscode.window.createTextEditorDecorationType({
+    color: "#F2C57C",
+  }),
+  comma: vscode.window.createTextEditorDecorationType({
+    color: "#FF5733",
+  }),
+  type: vscode.window.createTextEditorDecorationType({
+    color: "#A53860",
+  }),
 };
 
-function handleFreeExpr(
-  line: string,
-  startIdx: number
-): { newIdx: number; highlights: Highlight[] } {
-  /** Array to hold highlights. */
-  const highlights: Highlight[] = [];
-
-  // define prev char
-  const prevChar = startIdx === 0 ? null : line[startIdx - 1];
-
-  // make sure that it's in the start of the line or preceeded by white space, if not return
-  if (prevChar && !isWhiteSpace(prevChar))
-    return { newIdx: startIdx + 1, highlights: [] };
-
-  // divide by white spaces
-  const breakpoints = divideByDelimiter(line, " ", startIdx);
-
-  // filter breakpoints so consecutive white spaces are ignored
-  const filteredBreakpoints = breakpoints.filter((num, i) => {
-    if (i === 0) return true;
-    return num - breakpoints[i - 1] > 1;
-  });
-
-  /** Var to hold last breakpoint, so newIdx can be measured. */
-  let prev: number = startIdx;
-
-  // loop through break points and handle
-  for (let i = 0; i < filteredBreakpoints.length; i++) {
-    // get breakpoint
-    const bp = filteredBreakpoints[i];
-
-    // if first breakpoint then exprBase and exprData
-    if (i === 0) {
-      const newHighLights = handleExprBaseData(line, prev, bp);
-      highlights.push(...newHighLights);
-      prev = bp;
-      continue;
-    }
-
-    // handle key=value pairs as long as chain of valid key=value pairs is present
-    const newHighLights = handleKeyValuePairs(line, prev, bp);
-    if (newHighLights.length === 0) break;
-    highlights.push(...newHighLights);
-    prev = bp;
-  }
-
-  return { highlights, newIdx: prev };
-}
-
-function handleInterPolationExpr(
-  line: string,
-  startIdx: number
-): {
-  newIdx: number;
-  highlights: Highlight[];
-} {
-  /** Array to hold highlights */
-  let highlights: Highlight[] = [];
-
-  // add highlight color to "${" at the start
-  highlights.push({
-    start: startIdx,
-    end: startIdx + 2,
-    color: interpolationColor,
-  });
-
-  // get first non white space char after "${"
-  let firstCharIdx = startIdx + 2; // skip "${"
-  while (firstCharIdx < line.length && isWhiteSpace(line[firstCharIdx]))
-    firstCharIdx++;
-
-  // divide by white spaces
-  const breakpoints = divideByDelimiter(line, " ", firstCharIdx);
-
-  // filter breakpoints so consecutive white spaces are ignored
-  const filteredBreakpoints = breakpoints.filter((num, i) => {
-    if (i === 0) return true;
-    return num - breakpoints[i - 1] > 1;
-  });
-
-  /** Var to hold last breakpoint, so newIdx can be measured. */
-  let prev: number = firstCharIdx;
-
-  // loop through break points and handle
-  for (let i = 0; i < filteredBreakpoints.length; i++) {
-    // get breakpoint
-    const bp = filteredBreakpoints[i];
-
-    // if first breakpoint then exprBase and exprData
-    if (i === 0) {
-      const newHighLights = handleExprBaseData(line, prev, bp);
-      highlights.push(...newHighLights);
-      prev = bp;
-      continue;
-    }
-
-    // handle key=value pairs as long as chain of valid key=value pairs is present
-    const newHighLights = handleKeyValuePairs(line, prev, bp);
-    if (newHighLights.length === 0) break;
-    highlights.push(...newHighLights);
-    prev = bp;
-  }
-
-  // add highlight color to "${" at the end
-  const closeBracketsIdx = getNextChar(line, prev, "}");
-  if (closeBracketsIdx !== -1)
-    highlights.push({
-      start: closeBracketsIdx,
-      end: closeBracketsIdx + 1,
-      color: interpolationColor,
-    });
-
-  return { highlights, newIdx: prev };
-}
-
-function handleKeyValuePairs(
-  line: string,
-  start: number,
-  end: number
-): Highlight[] {
-  // get part that hold key value pair
-  const part = line.slice(start, end);
-
-  // get equal signs
-  const equalBp = divideByDelimiter(part, "=");
-
-  // return empty array if no or more than 1 equal signs are present
-  if (equalBp.length - 1 !== 1) return [];
-
-  /** Array that will hold highlighs for key, equal sign and value */
-  const highlights: Highlight[] = [];
-
-  const keyStart = start;
-  const keyEnd = keyStart + equalBp[0];
-  highlights.push({ start: keyStart, end: keyEnd, color: keyColor });
-
-  const equalStart = keyEnd;
-  const equalEnd = equalStart + 1;
-  highlights.push({ start: equalStart, end: equalEnd, color: equalColor });
-
-  const valueStart = equalEnd;
-  const valueEnd = end;
-  highlights.push({ start: valueStart, end: valueEnd, color: valueColor });
-
-  return highlights;
-}
-
-function handleExprBaseData(
-  line: string,
-  start: number,
-  end: number
-): Highlight[] {
-  // get part that hold base and data
-  const part = line.slice(start, end);
-
-  // get index of the first "." (exprBase)
-  const bp = getNextDelimiter(part, ".");
-
-  /** Array that will hold highlighs for expr base and data */
-  const highlights: Highlight[] = [];
-
-  // if there is a breakpoint, then add indices of exprBase and exprData, otherwise add exprBase only
-  if (bp !== -1) {
-    const exprBaseEnd = bp + start;
-    highlights.push({ start: start, end: exprBaseEnd, color: exprBaseColor });
-    highlights.push({ start: exprBaseEnd, end: end, color: exprDataColor });
-  } else {
-    highlights.push({ start: start, end: end, color: exprBaseColor });
-  }
-
-  return highlights;
-}
-
-/** Function to handle expressions */
-function handleExp(
-  line: string,
-  startIdx?: number
-): { newIdx: number; highlights: Highlight[] } {
-  // normalize startIdx to be zero if not defined
-  startIdx = startIdx ?? 0;
-
-  // get next and prev chars
-  const nextChar = line[startIdx + 1];
-  const prevChar = startIdx === 0 ? null : line[startIdx - 1];
-
-  // make sure next char is not "$" (escaped)
-  if (nextChar === "$") return { newIdx: startIdx + 2, highlights: [] }; // two here to skip the other "$" as well
-
-  // make sure prev char is not "$" (escaped)
-  if (prevChar === "$") return { newIdx: startIdx + 1, highlights: [] };
-
-  // make sure it's not single "$" char
-  if (isWhiteSpace(nextChar)) return { newIdx: startIdx + 1, highlights: [] };
-
-  // check if it's iterpolation format "${}" or free format "$" and handle it accordingly
-  if (nextChar === "{") return handleInterPolationExpr(line, startIdx);
-  else return handleFreeExpr(line, startIdx);
-}
-
-function handleDir(
-  line: string,
-  startIdx: number
-): { newIdx: number; highlights: Highlight[] } {
-  // if not at the start return directly
-  if (startIdx !== 0) return { newIdx: startIdx + 1, highlights: [] };
-
-  /** Array to hold highlights */
-  let highlights: Highlight[] = [];
-
-  // divide by white spaces
-  const breakpoints = divideByDelimiter(line, " ", startIdx);
-
-  // filter breakpoints so consecutive white spaces are ignored
-  const filteredBreakpoints = breakpoints.filter((num, i) => {
-    if (i === 0) return true;
-    return num - breakpoints[i - 1] > 1;
-  });
-
-  /** Var to hold last breakpoint, so newIdx can be measured. */
-  let prev: number = startIdx;
-
-  // start looping breakpoints and handle them
-  for (let i = 0; i < filteredBreakpoints.length; i++) {
-    // get breakpoint
-    const bp = filteredBreakpoints[i];
-
-    // if first breakpoint then exprBase
-    if (i === 0) {
-      highlights.push({ start: prev, end: bp, color: dirBaseColor });
-      prev = bp;
-      continue;
-    }
-
-    // if second breakpoint then exprData
-    if (i === 1) {
-      highlights.push({ start: prev, end: bp, color: dirDataColor });
-      prev = bp;
-      continue;
-    }
-
-    // after first two, check if follows key=value, if yes handle it as keyValue pair otherwise handle it as exprData
-    const keyValueHighlights = handleKeyValuePairs(line, prev, bp);
-    if (keyValueHighlights.length > 0) {
-      highlights.push(...keyValueHighlights);
-      prev = bp;
-    } else {
-      highlights.push({ start: prev, end: bp, color: dirDataColor });
-      prev = bp;
-    }
-  }
-
-  return { newIdx: prev, highlights };
-}
-
-export function highlightLine(line: string): Highlight[] {
-  /** Array to hold hightlights */
-  const highlights: Highlight[] = [];
-
-  // loop line
-  let i = 0;
-  while (i < line.length) {
-    // currnt char
-    const ch = line[i];
-
-    // if "$" handle expression
-    if (ch === "$") {
-      const { highlights: newHighlights, newIdx } = handleExp(line, i);
-      highlights.push(...newHighlights);
-      i = newIdx;
-      continue;
-    }
-
-    if (ch === "%") {
-      const { highlights: newHighlights, newIdx } = handleDir(line, i);
-      highlights.push(...newHighlights);
-      i = newIdx;
-      continue;
-    }
-
-    // increment index
-    i++;
-  }
-
-  return highlights;
-}
-
-/* ---------- decorations store & helpers ---------- */
-
-/**
- * Decorations store structure:
- * Map<documentUri, Map<decorationType, vscode.Range[]>>
- */
-const decorationsStore = new Map<
-  string,
-  Map<vscode.TextEditorDecorationType, vscode.Range[]>
->();
-
-function getDocStore(uri: string) {
-  let store = decorationsStore.get(uri);
-  if (!store) {
-    store = new Map();
-    // initialize entries for each decoration type we use
-    [
-      exprBaseColor,
-      exprDataColor,
-      dirBaseColor,
-      dirDataColor,
-      keyColor,
-      valueColor,
-      equalColor,
-    ].forEach((dec) => store!.set(dec, []));
-    decorationsStore.set(uri, store);
-  }
-  return store;
-}
-
-/** Remove all ranges that start on `lineNum` for all decoration types in this doc */
-function removeRangesForLine(
-  store: Map<vscode.TextEditorDecorationType, vscode.Range[]>,
-  lineNum: number
-) {
-  for (const [dec, ranges] of store) {
-    store.set(
-      dec,
-      ranges.filter((r) => r.start.line !== lineNum)
-    );
-  }
-}
-
-/** Shift ranges that are after `lineAfter` by `delta` lines (delta can be negative) */
-function shiftRangesAfterLine(
-  store: Map<vscode.TextEditorDecorationType, vscode.Range[]>,
-  lineAfter: number,
-  delta: number
-) {
-  if (delta === 0) return;
-  for (const [dec, ranges] of store) {
-    const shifted = ranges.map((r) => {
-      if (r.start.line > lineAfter) {
-        return new vscode.Range(
-          r.start.line + delta,
-          r.start.character,
-          r.end.line + delta,
-          r.end.character
-        );
-      }
-      return r;
-    });
-    store.set(dec, shifted);
-  }
-}
-
-/** Convert your Highlight {start,end,color} for a given line to vscode.Ranges and add into store */
-function addHighlightsForLine(
-  store: Map<vscode.TextEditorDecorationType, vscode.Range[]>,
-  lineNum: number,
-  hls: Highlight[]
-) {
-  for (const h of hls) {
-    const range = new vscode.Range(lineNum, h.start, lineNum, h.end);
-    const arr = store.get(h.color) ?? [];
-    arr.push(range);
-    store.set(h.color, arr);
-  }
-}
-
-/** Apply (setDecorations) current store ranges to the given editor */
-function applyAllDecorationsToEditor(
-  editor: vscode.TextEditor,
-  store: Map<vscode.TextEditorDecorationType, vscode.Range[]>
-) {
-  for (const [dec, ranges] of store) {
-    editor.setDecorations(dec, ranges);
-  }
-}
-
-/** Function to recompute highlights for every line of `doc` and update the store */
-function computeHighlightsForDocument(doc: vscode.TextDocument) {
-  const uriStr = doc.uri.toString();
-  const store = getDocStore(uriStr);
-
-  // Clear any existing ranges in the store for this doc
-  for (const dec of Array.from(store.keys())) {
-    store.set(dec, []);
-  }
-
-  // Iterate all lines and populate the store
-  for (let lineNum = 0; lineNum < doc.lineCount; lineNum++) {
-    const lineText = doc.lineAt(lineNum).text;
-    const hls = highlightLine(lineText) as Array<{
-      start: number;
-      end: number;
-      color: vscode.TextEditorDecorationType;
-    }>;
-
-    // add each highlight for the line into the store
-    for (const h of hls) {
-      // basic validation
-      if (typeof h.start !== "number" || typeof h.end !== "number" || !h.color)
-        continue;
-
-      const range = new vscode.Range(lineNum, h.start, lineNum, h.end);
-      const arr = store.get(h.color) ?? [];
-      arr.push(range);
-      store.set(h.color, arr);
-    }
-  }
-
-  return store;
-}
-
-/* Function to recompute only changed lines in a doc. */
-export const onHighlightUpdate = vscode.workspace.onDidChangeTextDocument(
-  (e) => {
-    // only handle YAML (or adapt to your language); prefer languageId
-    if (e.document.languageId !== "yaml") return;
-
-    const uriStr = e.document.uri.toString();
-    const editors = vscode.window.visibleTextEditors.filter(
-      (ed) => ed.document.uri.toString() === uriStr
-    );
-    if (!editors.length) return;
-
-    const store = getDocStore(uriStr);
-
-    for (const change of e.contentChanges) {
-      // old range (in the document before the edit)
-      const oldStartLine = change.range.start.line;
-      const oldEndLine = change.range.end.line;
-
-      // compute how many new lines the change introduced (number of '\n' in change.text)
-      const newLineCount =
-        change.text.length > 0 ? change.text.split("\n").length - 1 : 0;
-      const oldLineCount = oldEndLine - oldStartLine;
-      const delta = newLineCount - oldLineCount;
-
-      // 1) remove previous highlights that were on the old affected lines
-      for (let ln = oldStartLine; ln <= oldEndLine; ln++) {
-        removeRangesForLine(store, ln);
-      }
-
-      // 2) compute and add highlights for new lines — read them from the updated document
-      // The new lines start at oldStartLine and extend for newLineCount (n newlines -> n+1 lines)
-      const newLines = newLineCount >= 0 ? newLineCount + 1 : 1; // number of affected lines after edit
-      for (let i = 0; i < newLines; i++) {
-        const lineNum = oldStartLine + i;
-        // guard: document might be shorter (e.g., deletion at end)
-        if (lineNum >= e.document.lineCount) break;
-        const lineText = e.document.lineAt(lineNum).text;
-
-        // use your highlightLine function (assumed to return Highlight[] with .color)
-        const newHls = highlightLine(lineText);
-
-        // if your highlightLine returns {start,end} only, you'll need to map to colors here.
-        // This code assumes highlightLine returns {start,end,color}.
-        addHighlightsForLine(store, lineNum, newHls as any); // <-- keep typing/shape aligned with your implementation
-      }
-
-      // 3) shift ranges after the replaced block by delta lines (if any)
-      if (delta !== 0) {
-        shiftRangesAfterLine(store, oldEndLine, delta);
-      }
-    }
-
-    // 4) apply decorations to all visible editors for this doc
-    for (const editor of editors) {
-      applyAllDecorationsToEditor(editor, store);
-    }
-  }
-);
-
-/** Function to clear highlights of doc when closed. */
-export const onHighlightClose = vscode.workspace.onDidCloseTextDocument(
-  (doc) => {
-    decorationsStore.delete(doc.uri.toString());
-  }
-);
-
-/** Function to compute all highlights and apply them when doc is opened. */
-export const onOpenHighlight = vscode.workspace.onDidOpenTextDocument((doc) => {
-  // filter by language or file extension if you want (yaml example)
-  if (doc.languageId !== "yaml") return;
-
-  const uriStr = doc.uri.toString();
-  // compute and store highlights
-  const store = computeHighlightsForDocument(doc);
-
-  // apply to all visible editors showing this document
+export function handleHighlights(doc: vscode.TextDocument, path: string) {
+  // get editors
   const editors = vscode.window.visibleTextEditors.filter(
-    (ed) => ed.document.uri.toString() === uriStr
+    (e) => e.document === doc
   );
-  for (const editor of editors) {
-    applyAllDecorationsToEditor(editor, store);
+
+  // if no editors return
+  if (editors.length === 0) return;
+
+  // create a map for decorations
+  const expr_decoreMap: Record<
+    (typeof EXPR_COLORS)[number],
+    { type: vscode.TextEditorDecorationType; ranges: vscode.Range[] }
+  > = {
+    exprMark: { type: DECORATION_TYPES.exprMark, ranges: [] },
+    exprBase: { type: DECORATION_TYPES.exprBase, ranges: [] },
+    dot: { type: DECORATION_TYPES.dot, ranges: [] },
+    exprPath: { type: DECORATION_TYPES.exprPath, ranges: [] },
+    argsMark: { type: DECORATION_TYPES.argsMark, ranges: [] },
+    key: { type: DECORATION_TYPES.key, ranges: [] },
+    equal: { type: DECORATION_TYPES.equal, ranges: [] },
+    comma: { type: DECORATION_TYPES.comma, ranges: [] },
+    type: { type: DECORATION_TYPES.type, ranges: [] },
+  };
+
+  // array to hold decorations
+  const exprDecorations: DecorationsArray = [];
+
+  // handle highlights for both expressions and directives
+  const scalarArray = SCALAR_ARRAY_MAP.get(path);
+  const directivesArray = DIRECTIVE_ARRAY_MAP.get(path);
+
+  if (scalarArray) exprDecorations.push(...handleScalarTokens(scalarArray));
+
+  // push ranges for each decoration according to type
+  for (const d of exprDecorations) {
+    if (!d.linePos) continue;
+    const range = new vscode.Range(
+      d.linePos[0].line,
+      d.linePos[0].col,
+      d.linePos[1].line,
+      d.linePos[1].col
+    );
+    expr_decoreMap[d.color].ranges.push(range);
   }
-});
 
-/** Also handle when the active editor changes (user switches tabs) — show highlights for the newly active doc */
-export const onActiveEditorChange = vscode.window.onDidChangeActiveTextEditor(
-  (editor) => {
-    if (!editor) return;
-    const doc = editor.document;
-    if (doc.languageId !== "yaml") return;
+  // add highlights
+  for (const ed of editors)
+    for (const { type, ranges } of Object.values(expr_decoreMap)) {
+      ed.setDecorations(type, ranges);
+    }
+}
 
-    const uriStr = doc.uri.toString();
-
-    // If we don't have cached ranges yet (fresh open), compute them
-    const store = decorationsStore.get(uriStr)
-      ? getDocStore(uriStr)
-      : computeHighlightsForDocument(doc);
-
-    applyAllDecorationsToEditor(editor, store);
+function handleScalarTokens(scalarArray: Scalar[]): DecorationsArray {
+  const decorations: DecorationsArray = [];
+  for (const scalar of scalarArray) {
+    // if multi line and not a block literal ignore
+    if (
+      scalar.type !== "BLOCK_LITERAL" &&
+      scalar.linePos![0].line !== scalar.linePos![1].line
+    )
+      continue;
+    // handle decorations
+    decorations.push(...handleScalarTextTokens(scalar.tokens));
   }
-);
+  return decorations;
+}
 
-/** Optional: recompute all highlights when the document is saved (or when you want full refresh) */
-export const onSaveRefresh = vscode.workspace.onDidSaveTextDocument((doc) => {
-  if (doc.languageId !== "yaml" && !doc.fileName.endsWith(".yaml")) return;
-  const uriStr = doc.uri.toString();
-  const store = computeHighlightsForDocument(doc);
-  for (const editor of vscode.window.visibleTextEditors.filter(
-    (e) => e.document.uri.toString() === uriStr
-  )) {
-    applyAllDecorationsToEditor(editor, store);
+function handleScalarTextTokens(tokens: TextToken[]): DecorationsArray {
+  const decorations: DecorationsArray = [];
+  for (const tok of tokens) {
+    switch (tok.type) {
+      case TextTokenType.TEXT:
+        break;
+
+      case TextTokenType.EXPR:
+        const open = tok.exprMarkOpen;
+        const close = tok.exprMarkClose;
+        if (open)
+          decorations.push({ linePos: open.linePos, color: "exprMark" });
+        if (close)
+          decorations.push({ linePos: close.linePos, color: "exprMark" });
+        decorations.push(...handleScalarExprTokens(tok.exprTokens ?? []));
+        break;
+    }
   }
-});
+  return decorations;
+}
+function handleScalarExprTokens(tokens: ExprToken[]): DecorationsArray {
+  const decorations: DecorationsArray = [];
+  for (const tok of tokens) {
+    switch (tok.type) {
+      case ExprTokenType.BASE:
+        decorations.push({ linePos: tok.linePos, color: "exprBase" });
+        break;
 
-/** Function to clear all highlights when extension is closed. */
-export const onDeactivateHighlights = () => {
-  decorationsStore.clear();
-};
+      case ExprTokenType.PATH:
+        decorations.push({ linePos: tok.linePos, color: "exprPath" });
+        break;
+
+      case ExprTokenType.DOT:
+        decorations.push({ linePos: tok.linePos, color: "dot" });
+        break;
+
+      case ExprTokenType.ARGS:
+        const open = tok.argsMarkOpen;
+        const close = tok.argsMarkClose;
+        if (open)
+          decorations.push({ linePos: open.linePos, color: "argsMark" });
+        if (close)
+          decorations.push({ linePos: close.linePos, color: "argsMark" });
+        decorations.push(...handleScalarArgsTokens(tok.argsTokens ?? []));
+        break;
+
+      case ExprTokenType.TYPE:
+        decorations.push({ linePos: tok.linePos, color: "exprBase" });
+        break;
+    }
+  }
+  return decorations;
+}
+function handleScalarArgsTokens(tokens: ArgsToken[]): DecorationsArray {
+  const decorations: DecorationsArray = [];
+  for (const tok of tokens) {
+    switch (tok.type) {
+      case ArgsTokenType.COMMA:
+        decorations.push({ linePos: tok.linePos, color: "comma" });
+        break;
+
+      case ArgsTokenType.KEY_VALUE:
+        decorations.push(...handleScalarKeyValueTokens(tok.keyValueToks ?? []));
+        break;
+    }
+  }
+  return decorations;
+}
+function handleScalarKeyValueTokens(tokens: KeyValueToken[]): DecorationsArray {
+  const decorations: DecorationsArray = [];
+  for (const tok of tokens) {
+    switch (tok.type) {
+      case KeyValueTokenType.KEY:
+        decorations.push({ linePos: tok.linePos, color: "key" });
+        break;
+
+      case KeyValueTokenType.EQUAL:
+        decorations.push({ linePos: tok.linePos, color: "equal" });
+        break;
+
+      case KeyValueTokenType.VALUE:
+        decorations.push(...handleScalarTextTokens(tok.valueToks ?? []));
+        break;
+    }
+  }
+  return decorations;
+}
+
+function handleDirectiveTokens(
+  tokens: ModuleCache["directives"]
+): DecorationsArray {
+  return [];
+}
